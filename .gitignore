@@ -6,6 +6,7 @@ __pycache__/
 # Generated files
 *.png
 *.gif
+*.pth
 model_summary.txt
 
 # Distribution / packaging
