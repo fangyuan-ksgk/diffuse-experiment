@@ -7,21 +7,34 @@ def plot_frame_comparison(history_frames, action, true_next_frame, pred_next_fra
     """Plot history frames, true next frame, and predicted next frame side by side."""
     fig, axes = plt.subplots(1, 6, figsize=(20, 4))
     
+    # Custom colormap for snake game
+    colors = ['white', 'blue', 'red']  # 0=empty, 1=snake, 2=food
+    cmap = plt.matplotlib.colors.ListedColormap(colors)
+    
     # Plot history frames
     for i, frame in enumerate(history_frames):
-        axes[i].imshow(frame, cmap='coolwarm', vmin=0, vmax=2)
+        im = axes[i].imshow(frame, cmap=cmap, vmin=0, vmax=2)
         axes[i].set_title(f'History Frame {i+1}')
         axes[i].axis('off')
+        
+        # Add grid for better visibility
+        axes[i].grid(True, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
     
     # Plot true next frame
-    axes[4].imshow(true_next_frame, cmap='coolwarm', vmin=0, vmax=2)
+    axes[4].imshow(true_next_frame, cmap=cmap, vmin=0, vmax=2)
     axes[4].set_title('True Next Frame')
     axes[4].axis('off')
+    axes[4].grid(True, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
     
     # Plot predicted next frame
-    axes[5].imshow(pred_next_frame, cmap='coolwarm', vmin=0, vmax=2)
+    axes[5].imshow(pred_next_frame, cmap=cmap, vmin=0, vmax=2)
     axes[5].set_title('Predicted Next Frame')
     axes[5].axis('off')
+    axes[5].grid(True, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
+    
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=axes, ticks=[0, 1, 2])
+    cbar.set_ticklabels(['Empty', 'Snake', 'Food'])
     
     # Add action information
     action_names = ['UP', 'DOWN', 'LEFT', 'RIGHT']
@@ -70,24 +83,43 @@ def create_prediction_animation(predictions, save_path='prediction_animation.gif
 
 def visualize_prediction_sequence(predictions_file='predictions.npy'):
     """Load and visualize a sequence of predictions."""
-    predictions = np.load(predictions_file, allow_pickle=True)
+    try:
+        predictions = np.load(predictions_file, allow_pickle=True)
+    except FileNotFoundError: 
+        print(f"Error: Could not find predictions file '{predictions_file}'")
+        return
+    except Exception as e:
+        print(f"Error loading predictions: {str(e)}")
+        return
     
     # Create directory for individual frame comparisons
     import os
+    from tqdm import tqdm
     os.makedirs('prediction_frames', exist_ok=True)
     
-    # Plot individual frame comparisons
-    for i, pred in enumerate(predictions):
-        plot_frame_comparison(
-            pred['history'],
-            pred['action'],
-            pred['true_frame'] if 'true_frame' in pred else pred['history'][-1],
-            pred['prediction'],
-            save_path=f'prediction_frames/frame_{i:03d}.png'
-        )
+    # Plot individual frame comparisons with progress bar
+    print("\nGenerating frame comparisons...")
+    for i, pred in tqdm(enumerate(predictions), total=len(predictions), desc="Generating frames"):
+        try:
+            plot_frame_comparison(
+                pred['history'],
+                pred['action'],
+                pred['true_frame'] if 'true_frame' in pred else pred['history'][-1],
+                pred['prediction'],
+                save_path=f'prediction_frames/frame_{i:03d}.png'
+            )
+        except Exception as e:
+            print(f"\nError processing frame {i}: {str(e)}")
+            continue
     
-    # Create animation
-    create_prediction_animation(predictions)
+    # Create animation with improved colors
+    print("\nCreating animation...")
+    try:
+        create_prediction_animation(predictions)
+        print("\nVisualization complete! Check prediction_frames/ for individual frames")
+        print("and prediction_animation.gif for the animation.")
+    except Exception as e:
+        print(f"\nError creating animation: {str(e)}")
 
 if __name__ == '__main__':
     visualize_prediction_sequence()

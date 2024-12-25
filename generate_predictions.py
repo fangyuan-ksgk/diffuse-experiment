@@ -56,7 +56,9 @@ def generate_predictions(model, action_embedding, num_samples=5, sequence_length
             if len(history) == 4:
                 # Prepare input (use only the most recent frame)
                 current_frame = history[-1].clone().detach().unsqueeze(0).unsqueeze(0)  # [1, 1, 20, 20]
-                a = torch.tensor([action_int], dtype=torch.long).unsqueeze(0)
+                
+                # Initialize with random noise
+                x_t = torch.randn_like(current_frame)  # [1, 1, 20, 20]
                 
                 # Generate prediction
                 with torch.no_grad():
@@ -67,26 +69,25 @@ def generate_predictions(model, action_embedding, num_samples=5, sequence_length
                     for t in reversed(range(0, 1000, 100)):  # Sample fewer timesteps for speed
                         t_tensor = torch.tensor([t], dtype=torch.long)
                         
-                        # Get noise schedule parameters for timestep t
-                        alpha_t = scheduler.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
-                        sigma_t = scheduler.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
-                        
-                        # Get action embedding
-                        action_emb = action_embedding(a)
+                        # Get action embedding (ensure action is a tensor)
+                        action_tensor = torch.tensor([action_int], dtype=torch.long)
+                        action_emb = action_embedding(action_tensor)
                         
                         # Predict noise
                         pred_noise, _, _ = model(x_t, action_emb)
                         
-                        # Update prediction using noise prediction
-                        x_t = (x_t - sigma_t * pred_noise) / alpha_t
+                        # Get noise schedule parameters for timestep t
+                        alpha_t = scheduler.sqrt_alphas_cumprod[t]
+                        sigma_t = scheduler.sqrt_one_minus_alphas_cumprod[t]
                         
-                        # Add noise for next step if not the last step
+                        # Remove predicted noise and scale back
+                        x_start = (x_t - sigma_t * pred_noise) / alpha_t
+                        
+                        # If not the last step, add noise for next timestep
                         if t > 0:
-                            noise = torch.randn_like(x_t)
                             t_next = t - 100
-                            alpha_next = scheduler.sqrt_alphas_cumprod[t_next].view(-1, 1, 1, 1)
-                            sigma_next = scheduler.sqrt_one_minus_alphas_cumprod[t_next].view(-1, 1, 1, 1)
-                            x_t = alpha_next * x_t + sigma_next * noise
+                            noise = torch.randn_like(x_t)
+                            x_t, _ = scheduler.add_noise(x_start, torch.tensor([t_next]), noise)
                 
                 predictions.append({
                     'history': history.copy(),
