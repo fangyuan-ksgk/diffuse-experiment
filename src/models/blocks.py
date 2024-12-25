@@ -45,7 +45,7 @@ class AdaGroupNorm(nn.Module):
         cond shape: (b, t*e)
         x shape: (b, c, h, w)
         """
-        assert x.size(1) == self.in_channels
+        assert x.size(1) == self.in_channels, f"Expected {self.in_channels} channels, got {x.size(1)}"
         x = F.group_norm(x, self.num_groups, eps=GN_EPS)
         scale, shift = self.linear(cond)[:, :, None, None].chunk(2, dim=1)
         return x * (1 + scale) + shift
@@ -140,21 +140,40 @@ class SmallResBlock(nn.Module):
 class ResBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, cond_channels: int, attn: bool) -> None:
         super().__init__()
-        should_proj = in_channels != out_channels
-        self.proj = Conv1x1(in_channels, out_channels) if should_proj else nn.Identity()
-        self.norm1 = AdaGroupNorm(in_channels, cond_channels)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        # Main path with correct channel counts after input projection
+        self.norm1 = AdaGroupNorm(in_channels, cond_channels)  # Expect channels[0] not 1
         self.conv1 = Conv3x3(in_channels, out_channels)
         self.norm2 = AdaGroupNorm(out_channels, cond_channels)
         self.conv2 = Conv3x3(out_channels, out_channels)
-        self.attn = SelfAttention2d(out_channels) if attn else nn.Identity()
+        
+        # Skip connection with projection if needed
+        self.skip_proj = Conv1x1(in_channels, out_channels) if in_channels != out_channels else None
+        
+        # Optional attention
+        self.attn = SelfAttention2d(out_channels) if attn else None
+        
+        # Initialize final conv to zero
         nn.init.zeros_(self.conv2.weight)
 
     def forward(self, x: Tensor, cond: Tensor) -> Tensor:
-        r = self.proj(x)
+        identity = x
+        
+        # Main path
         x = self.conv1(F.silu(self.norm1(x, cond)))
         x = self.conv2(F.silu(self.norm2(x, cond)))
-        x = x + r
-        x = self.attn(x)
+        
+        # Skip connection with optional projection
+        if self.skip_proj is not None:
+            identity = self.skip_proj(identity)
+        x = x + identity
+        
+        # Optional attention
+        if self.attn is not None:
+            x = self.attn(x)
+            
         return x
 
 
@@ -168,23 +187,47 @@ class ResBlocks(nn.Module):
         list_out_channels: List[int],
         cond_channels: int,
         attn: bool,
+        skip_connection: bool = True,
     ) -> None:
         super().__init__()
         assert len(list_in_channels) == len(list_out_channels)
         self.in_channels = list_in_channels[0]
-        self.resblocks = nn.ModuleList(
-            [
-                ResBlock(in_ch, out_ch, cond_channels, attn)
-                for (in_ch, out_ch) in zip(list_in_channels, list_out_channels)
-            ]
-        ) # do we require some sort of 1-drift matching between list_in_channels and list_out_channels here?
+        self.skip_connection = skip_connection
+        
+        
+        # Ensure each ResBlock gets the correct input channels
+        self.resblocks = nn.ModuleList()
+        prev_out_channels = list_in_channels[0]
+        for i, (in_ch, out_ch) in enumerate(zip(list_in_channels, list_out_channels)):
+            # For blocks after the first one, input channels should match previous block's output
+            actual_in_channels = prev_out_channels if i > 0 else in_ch
+            self.resblocks.append(
+                ResBlock(
+                    in_channels=actual_in_channels,
+                    out_channels=out_ch,
+                    cond_channels=cond_channels,
+                    attn=attn
+                )
+            )
+            prev_out_channels = out_ch
 
     def forward(self, x: Tensor, cond: Tensor, to_cat: Optional[List[Tensor]] = None) -> Tensor:
         outputs = []
         for i, resblock in enumerate(self.resblocks):
-            x = x if to_cat is None else torch.cat((x, to_cat[i]), dim=1) # channel dimension concatenation
+            # Handle skip connections if provided
+            if self.skip_connection and to_cat is not None and i > 0:
+                skip = to_cat[i-1]
+                # Project skip connection to match current channels if needed
+                if skip.size(1) != x.size(1):
+
+                    skip_proj = Conv1x1(skip.size(1), x.size(1)).to(x.device)
+                    skip = skip_proj(skip)
+                x = x + skip  # Add skip connection instead of concatenating
+                
+            # Process through ResBlock
             x = resblock(x, cond)
             outputs.append(x)
+            
         return x, outputs
 
 
@@ -196,30 +239,53 @@ class ResBlocks(nn.Module):
 # - special ResBlock contains attention and action conditioning operation
 
 class UNet(nn.Module):
-    def __init__(self, cond_channels: int, depths: List[int], channels: List[int], attn_depths: List[int]) -> None:
+    def __init__(self, cond_channels: int, depths: List[int], channels: List[int], attn_depths: List[int], in_channels: int = 1) -> None:
         super().__init__()
         assert len(depths) == len(channels) == len(attn_depths)
         self._num_down = len(channels) - 1
+        self.in_channels = in_channels
+        
+        # Always project input to initial working channels
+        self.input_proj = Conv1x1(in_channels, channels[0])
+
 
         d_blocks, u_blocks = [], [] # [down-sampling | up-sampling] each has 'depths' number of blocks
         for i, n in enumerate(depths):
             c1 = channels[max(0, i - 1)]
             c2 = channels[i]
+            
+            # For downsampling blocks with proper channel growth
+            if i == 0:
+                # First block after input projection: channels[0] -> channels[0]
+                d_in_channels = [channels[0]] * n
+                d_out_channels = [channels[0]] * n
+            else:
+                # Subsequent blocks: channels[i-1] -> channels[i]
+                d_in_channels = [channels[i-1]] * n  # All blocks get same input channels
+                d_out_channels = [channels[i]] * n   # All blocks output same channels
+            
+            
             d_blocks.append(
                 ResBlocks(
-                    list_in_channels=[c1] + [c2] * (n - 1),
-                    list_out_channels=[c2] * n,
+                    list_in_channels=d_in_channels,
+                    list_out_channels=d_out_channels,
+                    skip_connection=True,
                     cond_channels=cond_channels,
                     attn=attn_depths[i],
-                ) # ResBlock with condition and attention
+                )
             )
+            
+            # For upsampling blocks, use channel sizes directly from channels list
+            u_in_channels = [channels[i]] * n + [channels[max(0, i-1)]]
+            u_out_channels = [channels[i]] * n + [channels[max(0, i-1)]]
+            
             u_blocks.append(
                 ResBlocks(
-                    list_in_channels=[2 * c2] * n + [c1 + c2],
-                    list_out_channels=[c2] * n + [c1],
+                    list_in_channels=u_in_channels,
+                    list_out_channels=u_out_channels,
                     cond_channels=cond_channels,
                     attn=attn_depths[i],
-                ) 
+                )
             ) # Upsample block take residual from down-sampling block, extra channels in input required
         self.d_blocks = nn.ModuleList(d_blocks)
         self.u_blocks = nn.ModuleList(reversed(u_blocks))
@@ -231,32 +297,153 @@ class UNet(nn.Module):
             attn=True,
         )
 
-        downsamples = [nn.Identity()] + [Downsample(c) for c in channels[:-1]]
-        upsamples = [nn.Identity()] + [Upsample(c) for c in reversed(channels[:-1])]
+        # Create downsampling layers with proper channel counts
+        downsamples = [nn.Identity()]  # First layer doesn't downsample
+        for i in range(len(channels)-1):
+            # Downsample should use input channel count
+            in_ch = channels[i]
+            downsamples.append(Downsample(in_ch))
+            
+        # Create upsampling layers with proper channel counts
+        upsamples = [nn.Identity()]  # First layer doesn't upsample
+        for i in reversed(range(len(channels)-1)):
+            # Upsample should use output channel count
+            out_ch = channels[i]
+            upsamples.append(Upsample(out_ch))
+            
         self.downsamples = nn.ModuleList(downsamples)
         self.upsamples = nn.ModuleList(upsamples)
 
     def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+        # Project input to initial working channels
+        x = self.input_proj(x)
+        
+        # Handle padding for proper downsampling
         *_, h, w = x.size()
         n = self._num_down
         padding_h = math.ceil(h / 2 ** n) * 2 ** n - h
         padding_w = math.ceil(w / 2 ** n) * 2 ** n - w
         x = F.pad(x, (0, padding_w, 0, padding_h))
 
-        d_outputs = []
-        for block, down in zip(self.d_blocks, self.downsamples):
-            x_down = down(x)
-            x, block_outputs = block(x_down, cond)
-            d_outputs.append((x_down, *block_outputs))
-
-        x, _ = self.mid_blocks(x, cond)
         
-        u_outputs = []
-        for block, up, skip in zip(self.u_blocks, self.upsamples, reversed(d_outputs)):
-            x_up = up(x)
-            x, block_outputs = block(x_up, cond, skip[::-1])
-            u_outputs.append((x_up, *block_outputs))
+        # Store original x for skip connections
+        x_orig = x
 
-        x = x[..., :h, :w]
-        return x, d_outputs, u_outputs
+        # Downsampling path
+        d_outputs = []
+        x_current = x_orig  # Start with original input
+        for i, (block, down) in enumerate(zip(self.d_blocks, self.downsamples)):
+            # Apply downsampling first
+            x_down = down(x_current)
+
+            
+            # Process through residual blocks
+            x_processed, block_outputs = block(x_down, cond)
+
+            
+            # Store outputs and update current tensor
+            d_outputs.append((x_down, *block_outputs))
+            x_current = x_processed
+
+        # Middle blocks
+        x_mid, _ = self.mid_blocks(x_current, cond)
+        
+        # Upsampling path
+        u_outputs = []
+        x_current = x_mid  # Start upsampling from mid block output
+        for i, (block, up, skip) in enumerate(zip(self.u_blocks, self.upsamples, reversed(d_outputs))):
+            # Apply upsampling
+            x_up = up(x_current)
+            try:
+                # Process through residual blocks with skip connections
+                x_processed, block_outputs = block(x_up, cond, skip[::-1])
+                # Store outputs and update current tensor
+                u_outputs.append((x_up, *block_outputs))
+                x_current = x_processed
+            except Exception as e:
+
+                raise e
+
+        # Remove padding and return final output
+        x_final = x_current[..., :h, :w]
+
+        return x_final, d_outputs, u_outputs
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
     

@@ -8,7 +8,12 @@ from data_preparation import generate_snake_data
 BATCH_SIZE = 32
 HISTORY_LENGTH = 4  # Number of past frames to use
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 100
+NUM_EPOCHS = 5  # Reduced for faster testing
+
+# Training configuration logged at start
+print("\nTraining Configuration:")
+print(f"Epochs: {NUM_EPOCHS}, Batch Size: {BATCH_SIZE}")
+print(f"Learning Rate: {LEARNING_RATE}, History Length: {HISTORY_LENGTH}\n")
 
 # Diffusion hyperparameters
 NUM_TIMESTEPS = 1000
@@ -18,7 +23,7 @@ BETA_END = 0.02
 # Model hyperparameters
 COND_CHANNELS = 16  # Dimension of action embedding
 DEPTHS = [2, 2, 2]  # Number of ResBlocks at each resolution
-CHANNELS = [64, 128, 256]  # Channel counts at each resolution
+CHANNELS = [32, 64, 128]  # Channel counts at each resolution (reduced for stability)
 ATTN_DEPTHS = [False, True, True]  # Apply attention at deeper levels
 
 
@@ -121,14 +126,16 @@ def create_dataloaders(num_episodes=1000, max_steps=100):
 
 def main():
     # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
     # Initialize models
     unet = UNet(
         cond_channels=COND_CHANNELS,
         depths=DEPTHS,
         channels=CHANNELS,
-        attn_depths=ATTN_DEPTHS
+        attn_depths=ATTN_DEPTHS,
+        in_channels=1
     ).to(device)
     action_embedding = ActionEmbedding().to(device)
     
@@ -181,7 +188,7 @@ def main():
             pred_noise, _, _ = unet(noisy_frames, action_emb)
             
             # Compute loss with importance sampling
-            loss_weights = scheduler.get_loss_weight(t)
+            loss_weights = scheduler.get_loss_weight(t).view(-1, 1, 1, 1)  # Reshape for broadcasting
             squared_diff = torch.square(target_noise - pred_noise)
             loss = torch.mean(loss_weights * squared_diff)
             
@@ -230,7 +237,7 @@ def main():
                 pred_noise, _, _ = unet(noisy_frames, action_emb)
                 
                 # Compute loss
-                loss_weights = scheduler.get_loss_weight(t)
+                loss_weights = scheduler.get_loss_weight(t).view(-1, 1, 1, 1)  # Reshape for broadcasting
                 squared_diff = torch.square(target_noise - pred_noise)
                 batch_loss = torch.mean(loss_weights * squared_diff)
                 val_loss += batch_loss.item()
@@ -241,6 +248,11 @@ def main():
             f"Train Loss: {train_loss:.4f}, "
             f"Val Loss: {val_loss:.4f}"
         )
+        
+        # Save models after each epoch
+        torch.save(unet.state_dict(), 'model_weights.pth')
+        torch.save(action_embedding.state_dict(), 'action_embedding_weights.pth')
+        print(f"Saved model weights for epoch {epoch}")
 
 
 if __name__ == "__main__":

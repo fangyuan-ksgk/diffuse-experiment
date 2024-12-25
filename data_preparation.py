@@ -97,7 +97,7 @@ def generate_snake_data(
     # Convert lists to tensors
     dataset_tensors = torch.stack(frame_histories)
     command_tensors = torch.tensor(commands, dtype=torch.long)
-    next_frame_tensors = torch.stack(next_frames)
+    next_frame_tensors = torch.stack(next_frames).unsqueeze(1)  # Add channel dimension
     
     return dataset_tensors, command_tensors, next_frame_tensors
 
