@@ -48,8 +48,8 @@ def generate_predictions(model, num_samples=5, sequence_length=10):
             # If we have enough history, generate prediction
             if len(history) == 4:
                 # Prepare input (use only the most recent frame)
-                current_frame = torch.tensor(history[-1], dtype=torch.float32).unsqueeze(0).unsqueeze(0)  # [1, 1, 20, 20]
-                a = torch.tensor([action], dtype=torch.long).unsqueeze(0)
+                current_frame = history[-1].clone().detach().unsqueeze(0).unsqueeze(0)  # [1, 1, 20, 20]
+                a = torch.tensor([action_int], dtype=torch.long).unsqueeze(0)
                 
                 # Generate prediction
                 with torch.no_grad():
