@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from src.models.blocks import UNet
 from train_diffusion import DiffusionScheduler
-from data_preparation import GameNGenSnake
+from data_preparation import GameNGenSnake, Direction, encode_frame
 
 def load_trained_model():
     model = UNet(
@@ -18,26 +18,32 @@ def load_trained_model():
 
 def generate_predictions(model, num_samples=5, sequence_length=10):
     scheduler = DiffusionScheduler(num_timesteps=1000)
-    game = GameNGenSnake(grid_size=20)
+    dir_to_int = {
+        Direction.UP: 0,
+        Direction.DOWN: 1,
+        Direction.LEFT: 2,
+        Direction.RIGHT: 3
+    }
     predictions = []
     
     for _ in range(num_samples):
         # Initialize game state
-        game.reset()
+        game = GameNGenSnake()
         history = []
         actions = []
         
         # Generate sequence
         for t in range(sequence_length):
             # Get current state
-            state = game.get_state()
-            history.append(state)
+            current_frame = encode_frame(game)
+            history.append(current_frame)
             if len(history) > 4:
                 history = history[-4:]
             
             # Random action for demonstration
-            action = np.random.choice([0, 1, 2, 3])  # UP, DOWN, LEFT, RIGHT
-            actions.append(action)
+            action = np.random.choice(list(Direction))
+            action_int = dir_to_int[action]
+            actions.append(action_int)
             
             # If we have enough history, generate prediction
             if len(history) == 4:
@@ -81,7 +87,9 @@ def generate_predictions(model, num_samples=5, sequence_length=10):
                 })
             
             # Update game state
-            game.step(action)
+            success, _ = game.update(action)
+            if not success or game.state.game_over:
+                break
     
     return predictions
 
