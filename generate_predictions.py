@@ -1,10 +1,11 @@
 import torch
 import numpy as np
 from src.models.blocks import UNet
-from train_diffusion import DiffusionScheduler
+from train_diffusion import DiffusionScheduler, ActionEmbedding
 from data_preparation import GameNGenSnake, Direction, encode_frame
 
-def load_trained_model():
+def load_trained_models():
+    # Load UNet
     model = UNet(
         cond_channels=16,  # Action embedding dimension
         depths=[2, 2, 2],  # Number of ResBlocks at each resolution
@@ -14,9 +15,15 @@ def load_trained_model():
     )
     model.load_state_dict(torch.load('model_weights.pth', map_location='cpu'))
     model.eval()
-    return model
+    
+    # Load action embedding
+    action_embedding = ActionEmbedding()
+    action_embedding.load_state_dict(torch.load('action_embedding_weights.pth', map_location='cpu'))
+    action_embedding.eval()
+    
+    return model, action_embedding
 
-def generate_predictions(model, num_samples=5, sequence_length=10):
+def generate_predictions(model, action_embedding, num_samples=5, sequence_length=10):
     scheduler = DiffusionScheduler(num_timesteps=1000)
     dir_to_int = {
         Direction.UP: 0,
@@ -59,26 +66,27 @@ def generate_predictions(model, num_samples=5, sequence_length=10):
                     # Denoise gradually
                     for t in reversed(range(0, 1000, 100)):  # Sample fewer timesteps for speed
                         t_tensor = torch.tensor([t], dtype=torch.long)
-                        noise_scale = scheduler.get_noise_scale(t_tensor)
                         
-                        # Prepare action embedding
-                        action_emb = torch.zeros(1, 16)  # cond_channels=16
-                        action_emb[0, a.item()] = 1.0  # One-hot encoding
+                        # Get noise schedule parameters for timestep t
+                        alpha_t = scheduler.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
+                        sigma_t = scheduler.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
                         
-                        # Model prediction
-                        pred, _, _ = model(x_t, action_emb)
+                        # Get action embedding
+                        action_emb = action_embedding(a)
                         
-                        # Update sample
+                        # Predict noise
+                        pred_noise, _, _ = model(x_t, action_emb)
+                        
+                        # Update prediction using noise prediction
+                        x_t = (x_t - sigma_t * pred_noise) / alpha_t
+                        
+                        # Add noise for next step if not the last step
                         if t > 0:
                             noise = torch.randn_like(x_t)
                             t_next = t - 100
-                            next_noise_scale = scheduler.get_noise_scale(torch.tensor([t_next]))
-                            x_t = (
-                                pred * (1 - next_noise_scale) +
-                                noise * next_noise_scale
-                            )
-                        else:
-                            x_t = pred
+                            alpha_next = scheduler.sqrt_alphas_cumprod[t_next].view(-1, 1, 1, 1)
+                            sigma_next = scheduler.sqrt_one_minus_alphas_cumprod[t_next].view(-1, 1, 1, 1)
+                            x_t = alpha_next * x_t + sigma_next * noise
                 
                 predictions.append({
                     'history': history.copy(),
@@ -94,11 +102,11 @@ def generate_predictions(model, num_samples=5, sequence_length=10):
     return predictions
 
 if __name__ == '__main__':
-    print("Loading model...")
-    model = load_trained_model()
+    print("Loading models...")
+    model, action_embedding = load_trained_models()
     
     print("Generating predictions...")
-    predictions = generate_predictions(model)
+    predictions = generate_predictions(model, action_embedding)
     
     print("Saving predictions...")
     np.save('predictions.npy', predictions)
