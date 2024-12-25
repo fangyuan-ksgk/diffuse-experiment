@@ -6,10 +6,11 @@ from data_preparation import GameNGenSnake
 
 def load_trained_model():
     model = UNet(
-        in_channels=5,  # 4 history frames + 1 action channel
-        out_channels=1,  # Next frame prediction
-        channels=[32, 64, 128],
-        depths=[2, 2, 2]
+        cond_channels=16,  # Action embedding dimension
+        depths=[2, 2, 2],  # Number of ResBlocks at each resolution
+        channels=[32, 64, 128],  # Channel counts at each resolution
+        attn_depths=[False, True, True],  # Apply attention at deeper levels
+        in_channels=1  # Single channel for game state
     )
     model.load_state_dict(torch.load('model_weights.pth', map_location='cpu'))
     model.eval()
@@ -40,22 +41,26 @@ def generate_predictions(model, num_samples=5, sequence_length=10):
             
             # If we have enough history, generate prediction
             if len(history) == 4:
-                # Prepare input
-                x = torch.tensor(np.stack(history), dtype=torch.float32).unsqueeze(0)
+                # Prepare input (use only the most recent frame)
+                current_frame = torch.tensor(history[-1], dtype=torch.float32).unsqueeze(0).unsqueeze(0)  # [1, 1, 20, 20]
                 a = torch.tensor([action], dtype=torch.long).unsqueeze(0)
                 
                 # Generate prediction
                 with torch.no_grad():
                     # Start from random noise
-                    x_t = torch.randn(1, 1, 20, 20)
+                    x_t = torch.randn_like(current_frame)  # [1, 1, 20, 20]
                     
                     # Denoise gradually
                     for t in reversed(range(0, 1000, 100)):  # Sample fewer timesteps for speed
                         t_tensor = torch.tensor([t], dtype=torch.long)
                         noise_scale = scheduler.get_noise_scale(t_tensor)
                         
+                        # Prepare action embedding
+                        action_emb = torch.zeros(1, 16)  # cond_channels=16
+                        action_emb[0, a.item()] = 1.0  # One-hot encoding
+                        
                         # Model prediction
-                        pred = model(x_t, noise_scale, x, a)
+                        pred, _, _ = model(x_t, action_emb)
                         
                         # Update sample
                         if t > 0:
