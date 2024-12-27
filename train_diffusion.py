@@ -1,8 +1,16 @@
+import os
+import argparse
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+from torchvision.models import resnet18
 from src.models.blocks import UNet
 from data_preparation import generate_snake_data
+from scipy import linalg
+import numpy as np
+
+# Create checkpoints directory if it doesn't exist
+os.makedirs('checkpoints', exist_ok=True)
 
 # Hyperparameters
 BATCH_SIZE = 32
@@ -83,6 +91,33 @@ class ActionEmbedding(nn.Module):
         return self.embedding(action_indices)
 
 
+def compute_fda(real_features, generated_features):
+    """Compute Fréchet Distance between real and generated feature distributions."""
+    # Calculate mean and covariance
+    mu1 = real_features.mean(dim=0)
+    sigma1 = torch.cov(real_features.T)
+    mu2 = generated_features.mean(dim=0)
+    sigma2 = torch.cov(generated_features.T)
+    
+    # Convert to numpy for scipy's implementation
+    mu1, mu2 = mu1.cpu().numpy(), mu2.cpu().numpy()
+    sigma1, sigma2 = sigma1.cpu().numpy(), sigma2.cpu().numpy()
+    
+    # Calculate squared difference between means
+    diff = mu1 - mu2
+    
+    # Calculate matrix sqrt of the product of covariances
+    covmean = linalg.sqrtm(sigma1.dot(sigma2))
+    
+    # Check for numerical errors
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    
+    # Calculate Fréchet Distance
+    fda = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
+    return float(fda)
+
+
 def create_dataloaders(num_episodes=1000, max_steps=100):
     """Create training and validation dataloaders."""
     # Generate data
@@ -120,17 +155,32 @@ def create_dataloaders(num_episodes=1000, max_steps=100):
 
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--resume', type=str, help='Path to checkpoint to resume from')
+    args = parser.parse_args()
+
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Initialize models
-    unet = UNet(
-        cond_channels=COND_CHANNELS,
-        depths=DEPTHS,
-        channels=CHANNELS,
-        attn_depths=ATTN_DEPTHS
-    ).to(device)
+    model_config = {
+        'cond_channels': COND_CHANNELS,
+        'depths': DEPTHS,
+        'channels': CHANNELS,
+        'attn_depths': ATTN_DEPTHS
+    }
+    unet = UNet(**model_config).to(device)
     action_embedding = ActionEmbedding().to(device)
+    
+    # Initialize feature extractor for FDA
+    feature_extractor = resnet18(pretrained=True).to(device)
+    # Remove classification layer
+    feature_extractor.fc = nn.Identity()
+    feature_extractor.eval()
+    # Freeze feature extractor parameters
+    for param in feature_extractor.parameters():
+        param.requires_grad = False
     
     # Initialize diffusion scheduler
     scheduler = DiffusionScheduler()
@@ -144,16 +194,29 @@ def main():
         setattr(scheduler, param, getattr(scheduler, param).to(device))
     
     # Initialize optimizer
-    optimizer = torch.optim.AdamW(
-        list(unet.parameters()) + list(action_embedding.parameters()),
-        lr=LEARNING_RATE
-    )
+    # Combine model parameters for optimization
+    model_params = list(unet.parameters()) + list(action_embedding.parameters())
+    optimizer = torch.optim.AdamW(model_params, lr=LEARNING_RATE)
+    
+    # Load checkpoint if resuming
+    start_epoch = 0
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print(f"Loading checkpoint from {args.resume}")
+            checkpoint = torch.load(args.resume)
+            unet.load_state_dict(checkpoint['model_state_dict'])
+            action_embedding.load_state_dict(checkpoint['action_embedding_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            print(f"Resuming from epoch {start_epoch}")
+        else:
+            print(f"No checkpoint found at {args.resume}")
     
     # Create dataloaders
     train_loader, val_loader = create_dataloaders()
     
     # Training loop
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(start_epoch, NUM_EPOCHS):
         # Training
         unet.train()
         train_loss = 0.0
@@ -236,11 +299,64 @@ def main():
                 val_loss += batch_loss.item()
         
         val_loss /= len(val_loader)
+        
+        # Compute FDA score on validation set
+        real_features = []
+        generated_features = []
+        with torch.no_grad():
+            for frames, actions, next_frames in val_loader:
+                frames = frames.to(device)
+                actions = actions.to(device)
+                next_frames = next_frames.to(device)
+                
+                # Get action embeddings
+                action_emb = action_embedding(actions)
+                
+                # Generate samples
+                noisy = torch.randn_like(next_frames)
+                for t in reversed(range(NUM_TIMESTEPS)):
+                    t_batch = torch.full((frames.shape[0],), t, device=device)
+                    pred_noise, _, _ = unet(noisy, action_emb, t_batch)
+                    alpha_t = scheduler.sqrt_alphas_cumprod[t]
+                    sigma_t = scheduler.sqrt_one_minus_alphas_cumprod[t]
+                    noisy = (noisy - sigma_t * pred_noise) / alpha_t
+                    if t > 0:
+                        noise = torch.randn_like(noisy)
+                        sigma = scheduler.posterior_variance[t].sqrt()
+                        noisy = noisy + sigma * noise
+                generated = noisy.clamp(-1, 1)
+                
+                # Extract features
+                real_batch = feature_extractor(next_frames)
+                gen_batch = feature_extractor(generated)
+                real_features.append(real_batch)
+                generated_features.append(gen_batch)
+        
+        # Compute FDA score
+        real_features = torch.cat(real_features, dim=0)
+        generated_features = torch.cat(generated_features, dim=0)
+        fda_score = compute_fda(real_features, generated_features)
+        
         print(
             f"Epoch {epoch}, "
             f"Train Loss: {train_loss:.4f}, "
-            f"Val Loss: {val_loss:.4f}"
+            f"Val Loss: {val_loss:.4f}, "
+            f"FDA Score: {fda_score:.4f}"
         )
+        
+        # Save checkpoint
+        checkpoint_name = f'checkpoint_epoch_{epoch:03d}.pt'
+        checkpoint_path = os.path.join('checkpoints', checkpoint_name)
+        checkpoint_data = {
+            'epoch': epoch,
+            'model_state_dict': unet.state_dict(),
+            'action_embedding_state_dict': action_embedding.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': train_loss,
+            'val_loss': val_loss
+        }
+        torch.save(checkpoint_data, checkpoint_path)
+        print(f"Saved checkpoint to {checkpoint_path}")
 
 
 if __name__ == "__main__":
